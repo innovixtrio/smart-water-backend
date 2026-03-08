@@ -75,6 +75,18 @@ init_db()
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXT
 
+def safe_int(v, default=0):
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+def safe_float(v, default=0.0):
+    try:
+        return float(v)
+    except Exception:
+        return default
+
 # ========== Root ==========
 @app.route("/")
 def home():
@@ -129,13 +141,13 @@ def login():
         })
     return jsonify({"error": "Invalid Credentials"}), 401
 
-# ========== Add single bill (same as before but more checks) ==========
+# ========== Add single bill ==========
 @app.route("/add_bill", methods=["POST"])
 def add_bill():
     data = request.get_json()
     try:
         user_id = int(data.get("user_id"))
-        month = data.get("month")
+        month = str(data.get("month")).strip()
         year = int(data.get("year"))
         units = int(data.get("units"))
         amount = float(data.get("amount"))
@@ -182,21 +194,22 @@ def upload_bills():
             reader = csv.DictReader(csvfile)
             for idx, row in enumerate(reader, start=1):
                 try:
-                    # look up user by email or use user_id
+                    # normalize keys and strip values
+                    lookup = {k.strip().lower(): (v.strip() if isinstance(v, str) else v) for k, v in (row.items())}
                     user_id = None
-                    if row.get("email"):
-                        u = cur.execute("SELECT id FROM users WHERE email=?", (row["email"],)).fetchone()
+                    if lookup.get("email"):
+                        u = cur.execute("SELECT id FROM users WHERE email=?", (lookup["email"],)).fetchone()
                         if u:
                             user_id = u["id"]
-                    elif row.get("user_id"):
-                        user_id = int(row["user_id"])
+                    elif lookup.get("user_id"):
+                        user_id = safe_int(lookup.get("user_id"))
                     if not user_id:
-                        errors.append(f"Row {idx}: user not found")
+                        errors.append(f"Row {idx}: user not found ({row})")
                         continue
-                    month = row.get("month")
-                    year = int(row.get("year"))
-                    units = int(row.get("units"))
-                    amount = float(row.get("amount"))
+                    month = lookup.get("month", "")
+                    year = safe_int(lookup.get("year"))
+                    units = safe_int(lookup.get("units"))
+                    amount = safe_float(lookup.get("amount"))
                     cur.execute("""
                         INSERT INTO bills (user_id,month,year,units,amount,status)
                         VALUES (?,?,?,?,?,'Unpaid')
@@ -213,18 +226,34 @@ def upload_bills():
         return jsonify({"inserted": inserted, "errors": errors})
     return jsonify({"error": "Invalid file type"}), 400
 
-# ========== Get bills ==========
+# ========== Get bills (supports filters via query params) ==========
 @app.route("/get_bills/<int:user_id>", methods=["GET"])
 def get_bills(user_id):
     conn = get_db()
-    q = """
+    month = request.args.get("month")
+    year = request.args.get("year")
+    status = request.args.get("status")
+
+    where_clauses = ["user_id=?"]
+    params = [user_id]
+
+    if month:
+        where_clauses.append("LOWER(month)=LOWER(?)")
+        params.append(month.strip())
+    if year:
+        where_clauses.append("year=?")
+        params.append(safe_int(year))
+    if status:
+        where_clauses.append("status=?")
+        params.append(status.strip())
+
+    q = f"""
         SELECT id,month,year,units,amount,status,created_at
         FROM bills
-        WHERE user_id=?
+        WHERE {' AND '.join(where_clauses)}
         ORDER BY year DESC, id DESC
     """
-    params = (user_id,)
-    bills = conn.execute(q, params).fetchall()
+    bills = conn.execute(q, tuple(params)).fetchall()
     conn.close()
     return jsonify([dict(row) for row in bills])
 
@@ -280,7 +309,18 @@ def get_reminders(user_id):
         ORDER BY r.reminder_date ASC
     """, (user_id,)).fetchall()
     conn.close()
-    return jsonify([dict(r) for r in reminders])
+    # convert sqlite rows to dict with friendly keys
+    results = []
+    for r in reminders:
+        results.append({
+            "id": r["id"],
+            "month": r["month"],
+            "year": r["year"],
+            "amount": r["amount"],
+            "status": r["status"],
+            "reminder_date": r["reminder_date"]
+        })
+    return jsonify(results)
 
 # ========== Analysis ==========
 @app.route("/analysis/<int:user_id>", methods=["GET"])
@@ -313,7 +353,7 @@ def get_anomalies(user_id):
     bills = [dict(r) for r in rows]
     conn.close()
     if not bills:
-        return jsonify({"anomalies": [], "message": "No bills"} )
+        return jsonify({"anomalies": [], "mean": 0, "std": 0})
     units_list = [b["units"] for b in bills]
     mean = sum(units_list)/len(units_list)
     # compute std
@@ -352,7 +392,8 @@ def predict_bill(user_id):
     next_x = n
     predicted_units = max(0, round(intercept + slope*next_x))
     # estimate price per unit as average
-    avg_price_per_unit = (sum(b["amount"] for b in bills)/sum(b["units"] for b in bills)) if sum(b["units"] for b in bills) > 0 else 0
+    total_units = sum(b["units"] for b in bills)
+    avg_price_per_unit = (sum(b["amount"] for b in bills)/total_units) if total_units > 0 else 0
     predicted_amount = round(predicted_units * avg_price_per_unit, 2)
     return jsonify({"predicted_units": predicted_units, "predicted_amount": predicted_amount, "slope": slope, "intercept": intercept})
 
