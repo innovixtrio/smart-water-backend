@@ -8,6 +8,8 @@ import os
 import csv
 from werkzeug.utils import secure_filename
 import math
+import re
+import traceback
 
 app = Flask(__name__)
 CORS(app)
@@ -15,14 +17,14 @@ CORS(app)
 DATABASE = "database.db"
 PDF_FOLDER = "pdfs"
 UPLOAD_FOLDER = "uploads"
-ALLOWED_EXT = {"csv", "pdf"}
+ALLOWED_EXT = {"csv", "pdf", "png", "jpg", "jpeg"}
 
 if not os.path.exists(PDF_FOLDER):
     os.makedirs(PDF_FOLDER)
 if not os.path.exists(UPLOAD_FOLDER):
     os.makedirs(UPLOAD_FOLDER)
 
-# ========== DB helpers ==========
+# ---------- DB helpers ----------
 def get_db():
     conn = sqlite3.connect(DATABASE)
     conn.row_factory = sqlite3.Row
@@ -32,7 +34,6 @@ def init_db():
     conn = get_db()
     c = conn.cursor()
 
-    # users: added is_admin flag
     c.execute("""
         CREATE TABLE IF NOT EXISTS users(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -43,6 +44,7 @@ def init_db():
         )
     """)
 
+    # add receipt_path column if not exists
     c.execute("""
         CREATE TABLE IF NOT EXISTS bills(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -51,6 +53,7 @@ def init_db():
             year INTEGER NOT NULL,
             units INTEGER NOT NULL,
             amount REAL NOT NULL,
+            receipt_path TEXT,
             status TEXT DEFAULT 'Unpaid',
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(user_id) REFERENCES users(id)
@@ -71,26 +74,51 @@ def init_db():
 
 init_db()
 
-# ========== Utilities ==========
+# ---------- Utilities ----------
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXT
 
+def clean_number_str(v):
+    """Remove commas, currency symbols and whitespace from numeric strings."""
+    if v is None:
+        return ""
+    s = str(v).strip()
+    # remove any characters except digits, dot, minus
+    s = re.sub(r'[^\d\.\-]', '', s)
+    return s
+
 def safe_int(v, default=0):
     try:
-        return int(v)
+        s = clean_number_str(v)
+        if s == "" or s == ".":
+            return default
+        return int(float(s))
     except Exception:
         return default
 
 def safe_float(v, default=0.0):
     try:
-        return float(v)
+        s = clean_number_str(v)
+        if s == "" or s == ".":
+            return default
+        f = float(s)
+        # sanity cap: if extremely large, return default (likely parsing error)
+        if abs(f) > 1e12:
+            return default
+        return f
     except Exception:
         return default
+
+# Global error handler -> always return JSON
+@app.errorhandler(Exception)
+def handle_exception(e):
+    traceback.print_exc()
+    return jsonify({"error": "Internal server error", "details": str(e)}), 500
 
 # ========== Root ==========
 @app.route("/")
 def home():
-    return "Smart Water Backend Running"
+    return jsonify({"message": "Smart Water Backend Running"})
 
 # ========== Auth / Users ==========
 @app.route("/register", methods=["POST"])
@@ -141,26 +169,49 @@ def login():
         })
     return jsonify({"error": "Invalid Credentials"}), 401
 
-# ========== Add single bill ==========
+# ========== Add single bill (supports JSON or multipart with optional receipt) ==========
 @app.route("/add_bill", methods=["POST"])
 def add_bill():
-    data = request.get_json()
-    try:
-        user_id = int(data.get("user_id"))
-        month = str(data.get("month")).strip()
-        year = int(data.get("year"))
-        units = int(data.get("units"))
-        amount = float(data.get("amount"))
-    except Exception:
-        return jsonify({"error": "Invalid input"}), 400
+    # If multipart: fields in request.form, file in request.files['receipt']
+    if request.content_type and "multipart/form-data" in request.content_type:
+        form = request.form
+        user_id = safe_int(form.get("user_id"))
+        month = (form.get("month") or "").strip()
+        year = safe_int(form.get("year"))
+        units = safe_int(form.get("units"))
+        amount = safe_float(form.get("amount"))
+        receipt_path = None
+        if 'receipt' in request.files:
+            f = request.files['receipt']
+            if f and allowed_file(f.filename):
+                filename = secure_filename(f.filename)
+                ts = datetime.now().strftime("%Y%m%d%H%M%S")
+                filename = f"{ts}_{filename}"
+                path = os.path.join(UPLOAD_FOLDER, filename)
+                f.save(path)
+                receipt_path = filename
+    else:
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "No data received"}), 400
+        user_id = safe_int(data.get("user_id"))
+        month = (data.get("month") or "").strip()
+        year = safe_int(data.get("year"))
+        units = safe_int(data.get("units"))
+        amount = safe_float(data.get("amount"))
+        receipt_path = None
+
+    # basic validation
+    if not user_id or not month or not year:
+        return jsonify({"error": "Missing required fields"}), 400
 
     conn = get_db()
     cursor = conn.cursor()
 
     cursor.execute("""
-        INSERT INTO bills (user_id,month,year,units,amount,status)
-        VALUES (?,?,?,?,?,'Unpaid')
-    """, (user_id, month, year, units, amount))
+        INSERT INTO bills (user_id,month,year,units,amount,receipt_path,status)
+        VALUES (?,?,?,?,?,?,?)
+    """, (user_id, month, year, units, amount, receipt_path, 'Unpaid'))
 
     bill_id = cursor.lastrowid
     reminder_date = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
@@ -171,7 +222,7 @@ def add_bill():
 
     conn.commit()
     conn.close()
-    return jsonify({"message": "Bill Added Successfully"})
+    return jsonify({"message": "Bill Added Successfully", "bill_id": bill_id})
 
 # ========== Bulk CSV upload ==========
 # CSV expected columns: email or user_id,month,year,units,amount
@@ -182,9 +233,9 @@ def upload_bills():
     file = request.files['file']
     if file.filename == '':
         return jsonify({"error": "No selected file"}), 400
-    if file and allowed_file(file.filename):
+    if file and allowed_file(file.filename) and file.filename.rsplit('.',1)[1].lower() == 'csv':
         filename = secure_filename(file.filename)
-        path = os.path.join(UPLOAD_FOLDER, filename)
+        path = os.path.join(UPLOAD_FOLDER, f"csv_{datetime.now().strftime('%Y%m%d%H%M%S')}_{filename}")
         file.save(path)
         inserted = 0
         errors = []
@@ -204,7 +255,7 @@ def upload_bills():
                     elif lookup.get("user_id"):
                         user_id = safe_int(lookup.get("user_id"))
                     if not user_id:
-                        errors.append(f"Row {idx}: user not found ({row})")
+                        errors.append(f"Row {idx}: user not found (email/user_id missing or not registered)")
                         continue
                     month = lookup.get("month", "")
                     year = safe_int(lookup.get("year"))
@@ -224,7 +275,7 @@ def upload_bills():
         conn.commit()
         conn.close()
         return jsonify({"inserted": inserted, "errors": errors})
-    return jsonify({"error": "Invalid file type"}), 400
+    return jsonify({"error": "Invalid file type, must be CSV"}), 400
 
 # ========== Get bills (supports filters via query params) ==========
 @app.route("/get_bills/<int:user_id>", methods=["GET"])
@@ -248,14 +299,27 @@ def get_bills(user_id):
         params.append(status.strip())
 
     q = f"""
-        SELECT id,month,year,units,amount,status,created_at
+        SELECT id,month,year,units,amount,receipt_path,status,created_at
         FROM bills
         WHERE {' AND '.join(where_clauses)}
         ORDER BY year DESC, id DESC
     """
     bills = conn.execute(q, tuple(params)).fetchall()
     conn.close()
-    return jsonify([dict(row) for row in bills])
+    # convert rows to dict; ensure numeric types for JSON consistency
+    out = []
+    for b in bills:
+        out.append({
+            "id": b["id"],
+            "month": b["month"],
+            "year": b["year"],
+            "units": b["units"],
+            "amount": float(b["amount"]) if b["amount"] is not None else 0.0,
+            "receipt_path": b["receipt_path"],
+            "status": b["status"],
+            "created_at": b["created_at"]
+        })
+    return jsonify(out)
 
 # ========== Mark paid ==========
 @app.route("/mark_paid/<int:bill_id>", methods=["POST"])
@@ -297,6 +361,14 @@ def download_bill(bill_id):
     pdf.output(filename)
     return send_file(filename, as_attachment=True)
 
+# ========== Serve uploaded receipts ==========
+@app.route("/receipt/<path:filename>", methods=["GET"])
+def serve_receipt(filename):
+    path = os.path.join(UPLOAD_FOLDER, filename)
+    if not os.path.exists(path):
+        return jsonify({"error": "File not found"}), 404
+    return send_file(path, as_attachment=False)
+
 # ========== Reminders ==========
 @app.route("/get_reminders/<int:user_id>", methods=["GET"])
 def get_reminders(user_id):
@@ -309,14 +381,13 @@ def get_reminders(user_id):
         ORDER BY r.reminder_date ASC
     """, (user_id,)).fetchall()
     conn.close()
-    # convert sqlite rows to dict with friendly keys
     results = []
     for r in reminders:
         results.append({
             "id": r["id"],
             "month": r["month"],
             "year": r["year"],
-            "amount": r["amount"],
+            "amount": float(r["amount"]) if r["amount"] is not None else 0.0,
             "status": r["status"],
             "reminder_date": r["reminder_date"]
         })
@@ -328,14 +399,13 @@ def get_analysis(user_id):
     conn = get_db()
     rows = conn.execute("SELECT units,amount,month,year,status FROM bills WHERE user_id=? ORDER BY year, rowid", (user_id,)).fetchall()
     bills = [dict(r) for r in rows]
-    total_units = sum(r["units"] for r in bills) if bills else 0
-    total_amount = sum(r["amount"] for r in bills) if bills else 0
+    total_units = sum(r.get("units",0) for r in bills) if bills else 0
+    total_amount = sum(float(r.get("amount",0.0)) for r in bills) if bills else 0.0
     paid_count = sum(1 for r in bills if r.get("status") == "Paid")
     unpaid_count = sum(1 for r in bills if r.get("status") != "Paid")
-    # time series for charts (month-year -> units)
     timeseries = []
     for r in bills:
-        timeseries.append({"month": r["month"], "year": r["year"], "units": r["units"], "amount": r["amount"]})
+        timeseries.append({"month": r.get("month"), "year": r.get("year"), "units": r.get("units",0), "amount": float(r.get("amount",0.0))})
     conn.close()
     return jsonify({
         "total_units": total_units,
@@ -354,15 +424,14 @@ def get_anomalies(user_id):
     conn.close()
     if not bills:
         return jsonify({"anomalies": [], "mean": 0, "std": 0})
-    units_list = [b["units"] for b in bills]
+    units_list = [b.get("units",0) for b in bills]
     mean = sum(units_list)/len(units_list)
-    # compute std
     variance = sum((u-mean)**2 for u in units_list)/len(units_list)
     std = math.sqrt(variance)
-    threshold = mean + 2*std  # simple threshold
+    threshold = mean + 2*std
     anomalies = []
     for b in bills:
-        if b["units"] > threshold:
+        if b.get("units",0) > threshold:
             anomalies.append({**b, "mean": mean, "std": std})
     return jsonify({"anomalies": anomalies, "mean": mean, "std": std})
 
@@ -375,25 +444,22 @@ def predict_bill(user_id):
     conn.close()
     if not bills or len(bills) < 2:
         return jsonify({"error": "Not enough data to predict", "required": 2}), 400
-    # prepare x = 0,1,2... y = units
     xs = list(range(len(bills)))
-    ys = [b["units"] for b in bills]
+    ys = [b.get("units",0) for b in bills]
     n = len(xs)
     sum_x = sum(xs)
     sum_y = sum(ys)
     sum_x2 = sum(x*x for x in xs)
     sum_xy = sum(x*y for x,y in zip(xs,ys))
     denom = (n*sum_x2 - sum_x*sum_x)
-    if denom == 0:
-        slope = 0
-    else:
+    slope = 0.0
+    if denom != 0:
         slope = (n*sum_xy - sum_x*sum_y)/denom
     intercept = (sum_y - slope*sum_x)/n
     next_x = n
     predicted_units = max(0, round(intercept + slope*next_x))
-    # estimate price per unit as average
-    total_units = sum(b["units"] for b in bills)
-    avg_price_per_unit = (sum(b["amount"] for b in bills)/total_units) if total_units > 0 else 0
+    total_units = sum(b.get("units",0) for b in bills)
+    avg_price_per_unit = (sum(float(b.get("amount",0.0)) for b in bills)/total_units) if total_units > 0 else 0.0
     predicted_amount = round(predicted_units * avg_price_per_unit, 2)
     return jsonify({"predicted_units": predicted_units, "predicted_amount": predicted_amount, "slope": slope, "intercept": intercept})
 
@@ -428,4 +494,4 @@ def admin_set_admin(user_id):
 # ========== Run ==========
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, debug=False)
