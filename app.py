@@ -1,4 +1,4 @@
-# app.py
+# app.py (full updated backend)
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import sqlite3
@@ -19,10 +19,8 @@ PDF_FOLDER = "pdfs"
 UPLOAD_FOLDER = "uploads"
 ALLOWED_EXT = {"csv", "pdf", "png", "jpg", "jpeg"}
 
-if not os.path.exists(PDF_FOLDER):
-    os.makedirs(PDF_FOLDER)
-if not os.path.exists(UPLOAD_FOLDER):
-    os.makedirs(UPLOAD_FOLDER)
+os.makedirs(PDF_FOLDER, exist_ok=True)
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 # ---------- DB helpers ----------
 def get_db():
@@ -44,15 +42,14 @@ def init_db():
         )
     """)
 
-    # add receipt_path column if not exists
     c.execute("""
         CREATE TABLE IF NOT EXISTS bills(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
             month TEXT NOT NULL,
             year INTEGER NOT NULL,
-            units INTEGER NOT NULL,
-            amount REAL NOT NULL,
+            units INTEGER NOT NULL DEFAULT 0,
+            amount REAL NOT NULL DEFAULT 0.0,
             receipt_path TEXT,
             status TEXT DEFAULT 'Unpaid',
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
@@ -65,7 +62,8 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
             bill_id INTEGER,
-            reminder_date TEXT
+            reminder_date TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
@@ -83,14 +81,13 @@ def clean_number_str(v):
     if v is None:
         return ""
     s = str(v).strip()
-    # remove any characters except digits, dot, minus
     s = re.sub(r'[^\d\.\-]', '', s)
     return s
 
 def safe_int(v, default=0):
     try:
         s = clean_number_str(v)
-        if s == "" or s == ".":
+        if s == "" or s == "." or s == "-":
             return default
         return int(float(s))
     except Exception:
@@ -99,46 +96,37 @@ def safe_int(v, default=0):
 def safe_float(v, default=0.0):
     try:
         s = clean_number_str(v)
-        if s == "" or s == ".":
+        if s == "" or s == "." or s == "-":
             return default
         f = float(s)
-        # sanity cap: if extremely large, return default (likely parsing error)
-        if abs(f) > 1e12:
+        if abs(f) > 1e14:
             return default
         return f
     except Exception:
         return default
 
-# Global error handler -> always return JSON
 @app.errorhandler(Exception)
 def handle_exception(e):
     traceback.print_exc()
     return jsonify({"error": "Internal server error", "details": str(e)}), 500
 
-# ========== Root ==========
 @app.route("/")
 def home():
     return jsonify({"message": "Smart Water Backend Running"})
 
-# ========== Auth / Users ==========
 @app.route("/register", methods=["POST"])
 def register():
     data = request.get_json()
     if not data:
         return jsonify({"error": "No data received"}), 400
-
     name = data.get("name")
-    email = data.get("email")
+    email = (data.get("email") or "").strip().lower()
     password = data.get("password")
     if not (name and email and password):
         return jsonify({"error": "Missing fields"}), 400
-
     try:
         conn = get_db()
-        conn.execute(
-            "INSERT INTO users (name,email,password) VALUES (?,?,?)",
-            (name, email, password)
-        )
+        conn.execute("INSERT INTO users (name,email,password) VALUES (?,?,?)", (name.strip(), email, password))
         conn.commit()
         conn.close()
         return jsonify({"message": "User Registered Successfully"})
@@ -152,27 +140,20 @@ def login():
     data = request.get_json()
     if not data:
         return jsonify({"error": "No data received"}), 400
-    email = data.get("email")
+    email = (data.get("email") or "").strip().lower()
     password = data.get("password")
+    if not (email and password):
+        return jsonify({"error": "Missing fields"}), 400
     conn = get_db()
-    user = conn.execute(
-        "SELECT * FROM users WHERE email=? AND password=?",
-        (email, password)
-    ).fetchone()
+    user = conn.execute("SELECT * FROM users WHERE email=? AND password=?", (email, password)).fetchone()
     conn.close()
     if user:
-        return jsonify({
-            "message": "Login Success",
-            "user_id": user["id"],
-            "name": user["name"],
-            "is_admin": bool(user["is_admin"])
-        })
+        return jsonify({"message": "Login Success", "user_id": user["id"], "name": user["name"], "is_admin": bool(user["is_admin"])})
     return jsonify({"error": "Invalid Credentials"}), 401
 
-# ========== Add single bill (supports JSON or multipart with optional receipt) ==========
 @app.route("/add_bill", methods=["POST"])
 def add_bill():
-    # If multipart: fields in request.form, file in request.files['receipt']
+    # Accept both JSON and multipart/form-data (with optional receipt)
     if request.content_type and "multipart/form-data" in request.content_type:
         form = request.form
         user_id = safe_int(form.get("user_id"))
@@ -201,127 +182,135 @@ def add_bill():
         amount = safe_float(data.get("amount"))
         receipt_path = None
 
-    # basic validation
     if not user_id or not month or not year:
-        return jsonify({"error": "Missing required fields"}), 400
+        return jsonify({"error": "Missing required fields (user_id, month, year)"}), 400
 
     conn = get_db()
     cursor = conn.cursor()
 
-    cursor.execute("""
-        INSERT INTO bills (user_id,month,year,units,amount,receipt_path,status)
-        VALUES (?,?,?,?,?,?,?)
-    """, (user_id, month, year, units, amount, receipt_path, 'Unpaid'))
+    existing = cursor.execute("SELECT id FROM bills WHERE user_id=? AND LOWER(month)=LOWER(?) AND year=?", (user_id, month.strip(), year)).fetchone()
+    if existing:
+        conn.close()
+        return jsonify({"error": f"Bill for {month} {year} already exists"}), 400
+
+    cursor.execute("INSERT INTO bills (user_id,month,year,units,amount,receipt_path,status) VALUES (?,?,?,?,?,?,?)",
+                   (user_id, month, year, units, amount, receipt_path, 'Unpaid'))
 
     bill_id = cursor.lastrowid
     reminder_date = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
-    cursor.execute("""
-        INSERT INTO reminders (user_id,bill_id,reminder_date)
-        VALUES (?,?,?)
-    """, (user_id, bill_id, reminder_date))
+    cursor.execute("INSERT INTO reminders (user_id,bill_id,reminder_date) VALUES (?,?,?)", (user_id, bill_id, reminder_date))
 
     conn.commit()
     conn.close()
     return jsonify({"message": "Bill Added Successfully", "bill_id": bill_id})
 
-# ========== Bulk CSV upload ==========
-# CSV expected columns: email or user_id,month,year,units,amount
+@app.route("/delete_bill/<int:bill_id>", methods=["POST"])
+def delete_bill(bill_id):
+    conn = get_db()
+    conn.execute("DELETE FROM reminders WHERE bill_id=?", (bill_id,))
+    conn.execute("DELETE FROM bills WHERE id=?", (bill_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({"message": "Bill deleted"})
+
 @app.route("/upload_bills", methods=["POST"])
 def upload_bills():
+    # CSV with columns: email or user_id, month, year, units, amount
     if 'file' not in request.files:
         return jsonify({"error": "No file part"}), 400
     file = request.files['file']
     if file.filename == '':
         return jsonify({"error": "No selected file"}), 400
-    if file and allowed_file(file.filename) and file.filename.rsplit('.',1)[1].lower() == 'csv':
-        filename = secure_filename(file.filename)
-        path = os.path.join(UPLOAD_FOLDER, f"csv_{datetime.now().strftime('%Y%m%d%H%M%S')}_{filename}")
-        file.save(path)
-        inserted = 0
-        errors = []
-        conn = get_db()
-        cur = conn.cursor()
-        with open(path, newline='', encoding='utf-8') as csvfile:
-            reader = csv.DictReader(csvfile)
-            for idx, row in enumerate(reader, start=1):
-                try:
-                    # normalize keys and strip values
-                    lookup = {k.strip().lower(): (v.strip() if isinstance(v, str) else v) for k, v in (row.items())}
-                    user_id = None
-                    if lookup.get("email"):
-                        u = cur.execute("SELECT id FROM users WHERE email=?", (lookup["email"],)).fetchone()
+    ext = file.filename.rsplit('.', 1)[1].lower() if '.' in file.filename else ''
+    if ext != 'csv':
+        return jsonify({"error": "Invalid file type, must be CSV"}), 400
+
+    filename = secure_filename(file.filename)
+    path = os.path.join(UPLOAD_FOLDER, f"csv_{datetime.now().strftime('%Y%m%d%H%M%S')}_{filename}")
+    file.save(path)
+
+    inserted = 0
+    errors = []
+    conn = get_db()
+    cur = conn.cursor()
+    with open(path, newline='', encoding='utf-8') as csvfile:
+        reader = csv.DictReader(csvfile)
+        for idx, row in enumerate(reader, start=1):
+            try:
+                # Normalize keys to lower case
+                lookup = { (k.strip().lower() if isinstance(k,str) else k): (v.strip() if isinstance(v, str) else v) for k, v in row.items() }
+                user_id = None
+                if lookup.get("email"):
+                    email = (lookup.get("email") or "").strip().lower()
+                    if email:
+                        u = cur.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()
                         if u:
                             user_id = u["id"]
-                    elif lookup.get("user_id"):
-                        user_id = safe_int(lookup.get("user_id"))
-                    if not user_id:
-                        errors.append(f"Row {idx}: user not found (email/user_id missing or not registered)")
-                        continue
-                    month = lookup.get("month", "")
-                    year = safe_int(lookup.get("year"))
-                    units = safe_int(lookup.get("units"))
-                    amount = safe_float(lookup.get("amount"))
-                    cur.execute("""
-                        INSERT INTO bills (user_id,month,year,units,amount,status)
-                        VALUES (?,?,?,?,?,'Unpaid')
-                    """, (user_id, month, year, units, amount))
-                    bill_id = cur.lastrowid
-                    reminder_date = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
-                    cur.execute("INSERT INTO reminders (user_id,bill_id,reminder_date) VALUES (?,?,?)",
-                                (user_id, bill_id, reminder_date))
-                    inserted += 1
-                except Exception as e:
-                    errors.append(f"Row {idx}: {str(e)}")
-        conn.commit()
-        conn.close()
-        return jsonify({"inserted": inserted, "errors": errors})
-    return jsonify({"error": "Invalid file type, must be CSV"}), 400
+                if not user_id and lookup.get("user_id"):
+                    user_id = safe_int(lookup.get("user_id"))
 
-# ========== Get bills (supports filters via query params) ==========
+                if not user_id:
+                    errors.append(f"Row {idx}: user not found (email/user_id missing or not registered)")
+                    continue
+
+                month = (lookup.get("month") or "").strip()
+                if not month:
+                    errors.append(f"Row {idx}: missing month")
+                    continue
+
+                year = safe_int(lookup.get("year"))
+                units = safe_int(lookup.get("units"))
+                amount = safe_float(lookup.get("amount"))
+
+                exist = cur.execute("SELECT id FROM bills WHERE user_id=? AND LOWER(month)=LOWER(?) AND year=?", (user_id, month.strip(), year)).fetchone()
+                if exist:
+                    errors.append(f"Row {idx}: duplicate for {month} {year}")
+                    continue
+
+                cur.execute("INSERT INTO bills (user_id,month,year,units,amount,status) VALUES (?,?,?,?,?)",
+                            (user_id, month, year, units, amount, 'Unpaid'))
+
+                bill_id = cur.lastrowid
+                reminder_date = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
+                cur.execute("INSERT INTO reminders (user_id,bill_id,reminder_date) VALUES (?,?,?)", (user_id, bill_id, reminder_date))
+                inserted += 1
+            except Exception as e:
+                errors.append(f"Row {idx}: {str(e)}")
+    conn.commit()
+    conn.close()
+    return jsonify({"inserted": inserted, "errors": errors})
+
 @app.route("/get_bills/<int:user_id>", methods=["GET"])
 def get_bills(user_id):
     conn = get_db()
     month = request.args.get("month")
     year = request.args.get("year")
     status = request.args.get("status")
-
     where_clauses = ["user_id=?"]
     params = [user_id]
-
     if month:
-        where_clauses.append("LOWER(month)=LOWER(?)")
-        params.append(month.strip())
+        if month.strip() != "":
+            where_clauses.append("LOWER(month)=LOWER(?)")
+            params.append(month.strip())
     if year:
-        where_clauses.append("year=?")
-        params.append(safe_int(year))
+        try:
+            y = int(year)
+            where_clauses.append("year=?")
+            params.append(y)
+        except Exception:
+            pass
     if status:
-        where_clauses.append("status=?")
-        params.append(status.strip())
-
-    q = f"""
-        SELECT id,month,year,units,amount,receipt_path,status,created_at
-        FROM bills
-        WHERE {' AND '.join(where_clauses)}
-        ORDER BY year DESC, id DESC
-    """
+        if status.strip().lower() in ("paid", "unpaid"):
+            where_clauses.append("status=?")
+            params.append(status.strip())
+    q = f"SELECT id,month,year,units,amount,receipt_path,status,created_at FROM bills WHERE {' AND '.join(where_clauses)} ORDER BY year DESC, id DESC"
     bills = conn.execute(q, tuple(params)).fetchall()
     conn.close()
-    # convert rows to dict; ensure numeric types for JSON consistency
     out = []
     for b in bills:
-        out.append({
-            "id": b["id"],
-            "month": b["month"],
-            "year": b["year"],
-            "units": b["units"],
-            "amount": float(b["amount"]) if b["amount"] is not None else 0.0,
-            "receipt_path": b["receipt_path"],
-            "status": b["status"],
-            "created_at": b["created_at"]
-        })
+        out.append({"id": b["id"], "month": b["month"], "year": b["year"], "units": int(b["units"] or 0), "amount": float(b["amount"] or 0.0), "receipt_path": b["receipt_path"] or "", "status": b["status"], "created_at": b["created_at"]})
     return jsonify(out)
 
-# ========== Mark paid ==========
 @app.route("/mark_paid/<int:bill_id>", methods=["POST"])
 def mark_paid(bill_id):
     conn = get_db()
@@ -330,18 +319,10 @@ def mark_paid(bill_id):
     conn.close()
     return jsonify({"message": "Marked as Paid"})
 
-# ========== Download bill PDF ==========
 @app.route("/download_bill/<int:bill_id>", methods=["GET"])
 def download_bill(bill_id):
     conn = get_db()
-    bill = conn.execute("""
-        SELECT users.name,users.email,
-               bills.month,bills.year,
-               bills.units,bills.amount,bills.status
-        FROM bills
-        JOIN users ON bills.user_id=users.id
-        WHERE bills.id=?
-    """, (bill_id,)).fetchone()
+    bill = conn.execute("SELECT users.name,users.email, bills.month,bills.year, bills.units,bills.amount,bills.status FROM bills JOIN users ON bills.user_id=users.id WHERE bills.id=?", (bill_id,)).fetchone()
     conn.close()
     if not bill:
         return jsonify({"error": "Bill not found"}), 404
@@ -361,7 +342,6 @@ def download_bill(bill_id):
     pdf.output(filename)
     return send_file(filename, as_attachment=True)
 
-# ========== Serve uploaded receipts ==========
 @app.route("/receipt/<path:filename>", methods=["GET"])
 def serve_receipt(filename):
     path = os.path.join(UPLOAD_FOLDER, filename)
@@ -369,53 +349,31 @@ def serve_receipt(filename):
         return jsonify({"error": "File not found"}), 404
     return send_file(path, as_attachment=False)
 
-# ========== Reminders ==========
 @app.route("/get_reminders/<int:user_id>", methods=["GET"])
 def get_reminders(user_id):
     conn = get_db()
-    reminders = conn.execute("""
-        SELECT r.id, r.reminder_date, b.month, b.year, b.amount, b.status
-        FROM reminders r
-        JOIN bills b ON r.bill_id=b.id
-        WHERE r.user_id=?
-        ORDER BY r.reminder_date ASC
-    """, (user_id,)).fetchall()
+    reminders = conn.execute("SELECT r.id, r.reminder_date, b.month, b.year, b.amount, b.status FROM reminders r JOIN bills b ON r.bill_id=b.id WHERE r.user_id=? ORDER BY r.reminder_date ASC", (user_id,)).fetchall()
     conn.close()
     results = []
     for r in reminders:
-        results.append({
-            "id": r["id"],
-            "month": r["month"],
-            "year": r["year"],
-            "amount": float(r["amount"]) if r["amount"] is not None else 0.0,
-            "status": r["status"],
-            "reminder_date": r["reminder_date"]
-        })
+        results.append({"id": r["id"], "month": r["month"], "year": r["year"], "amount": float(r["amount"] or 0.0), "status": r["status"], "reminder_date": r["reminder_date"]})
     return jsonify(results)
 
-# ========== Analysis ==========
 @app.route("/analysis/<int:user_id>", methods=["GET"])
 def get_analysis(user_id):
     conn = get_db()
     rows = conn.execute("SELECT units,amount,month,year,status FROM bills WHERE user_id=? ORDER BY year, rowid", (user_id,)).fetchall()
     bills = [dict(r) for r in rows]
-    total_units = sum(r.get("units",0) for r in bills) if bills else 0
-    total_amount = sum(float(r.get("amount",0.0)) for r in bills) if bills else 0.0
-    paid_count = sum(1 for r in bills if r.get("status") == "Paid")
-    unpaid_count = sum(1 for r in bills if r.get("status") != "Paid")
+    total_units = sum(int(r.get("units",0) or 0) for r in bills) if bills else 0
+    total_amount = sum(float(r.get("amount",0.0) or 0.0) for r in bills) if bills else 0.0
+    paid_count = sum(1 for r in bills if (r.get("status") or "").lower() == "paid")
+    unpaid_count = sum(1 for r in bills if (r.get("status") or "").lower() != "paid")
     timeseries = []
     for r in bills:
-        timeseries.append({"month": r.get("month"), "year": r.get("year"), "units": r.get("units",0), "amount": float(r.get("amount",0.0))})
+        timeseries.append({"month": r.get("month"), "year": r.get("year"), "units": int(r.get("units",0) or 0), "amount": float(r.get("amount",0.0) or 0.0)})
     conn.close()
-    return jsonify({
-        "total_units": total_units,
-        "total_amount": total_amount,
-        "paid_count": paid_count,
-        "unpaid_count": unpaid_count,
-        "timeseries": timeseries
-    })
+    return jsonify({"total_units": total_units, "total_amount": total_amount, "paid_count": paid_count, "unpaid_count": unpaid_count, "timeseries": timeseries})
 
-# ========== Anomaly detection ==========
 @app.route("/anomalies/<int:user_id>", methods=["GET"])
 def get_anomalies(user_id):
     conn = get_db()
@@ -424,18 +382,17 @@ def get_anomalies(user_id):
     conn.close()
     if not bills:
         return jsonify({"anomalies": [], "mean": 0, "std": 0})
-    units_list = [b.get("units",0) for b in bills]
+    units_list = [int(b.get("units",0) or 0) for b in bills]
     mean = sum(units_list)/len(units_list)
     variance = sum((u-mean)**2 for u in units_list)/len(units_list)
     std = math.sqrt(variance)
     threshold = mean + 2*std
     anomalies = []
     for b in bills:
-        if b.get("units",0) > threshold:
+        if int(b.get("units",0) or 0) > threshold:
             anomalies.append({**b, "mean": mean, "std": std})
     return jsonify({"anomalies": anomalies, "mean": mean, "std": std})
 
-# ========== Prediction (very simple linear regression on time index) ==========
 @app.route("/predict/<int:user_id>", methods=["GET"])
 def predict_bill(user_id):
     conn = get_db()
@@ -445,7 +402,7 @@ def predict_bill(user_id):
     if not bills or len(bills) < 2:
         return jsonify({"error": "Not enough data to predict", "required": 2}), 400
     xs = list(range(len(bills)))
-    ys = [b.get("units",0) for b in bills]
+    ys = [int(b.get("units",0) or 0) for b in bills]
     n = len(xs)
     sum_x = sum(xs)
     sum_y = sum(ys)
@@ -458,12 +415,11 @@ def predict_bill(user_id):
     intercept = (sum_y - slope*sum_x)/n
     next_x = n
     predicted_units = max(0, round(intercept + slope*next_x))
-    total_units = sum(b.get("units",0) for b in bills)
-    avg_price_per_unit = (sum(float(b.get("amount",0.0)) for b in bills)/total_units) if total_units > 0 else 0.0
+    total_units = sum(ys)
+    avg_price_per_unit = (sum(float(b.get("amount",0.0) or 0.0) for b in bills)/total_units) if total_units > 0 else 0.0
     predicted_amount = round(predicted_units * avg_price_per_unit, 2)
-    return jsonify({"predicted_units": predicted_units, "predicted_amount": predicted_amount, "slope": slope, "intercept": intercept})
+    return jsonify({"predicted_units": int(predicted_units), "predicted_amount": float(predicted_amount), "slope": slope, "intercept": intercept})
 
-# ========== Admin endpoints ==========
 @app.route("/admin/users", methods=["GET"])
 def admin_users():
     conn = get_db()
@@ -483,7 +439,7 @@ def admin_delete_user(user_id):
 
 @app.route("/admin/set_admin/<int:user_id>", methods=["POST"])
 def admin_set_admin(user_id):
-    data = request.get_json()
+    data = request.get_json() or {}
     make_admin = bool(data.get("is_admin", False))
     conn = get_db()
     conn.execute("UPDATE users SET is_admin=? WHERE id=?", (1 if make_admin else 0, user_id))
@@ -491,7 +447,6 @@ def admin_set_admin(user_id):
     conn.close()
     return jsonify({"message": "Updated admin status", "is_admin": make_admin})
 
-# ========== Run ==========
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False)
